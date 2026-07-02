@@ -263,6 +263,7 @@ lombok.launch.AnnotationProcessorHider$ClaimingProcessor,isolating</echo>
 				<include name="module-info.class" />
 				<include name="lombok/*.class" />
 				<include name="lombok/experimental/**" />
+				<include name="lombok/xium/**" />
 				<include name="lombok/extern/**" />
 				<include name="lombok/launch/**" />
 				<include name="lombok/delombok/ant/Tasks*" />
