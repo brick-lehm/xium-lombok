@@ -1,5 +1,8 @@
 package lombok.javac.handlers.xium;
 
+import static lombok.javac.Javac.COMPACT_RECORD_CONSTRUCTOR;
+import static lombok.javac.Javac.RECORD;
+import static lombok.javac.handlers.JavacHandlerUtil.cloneType;
 import static lombok.javac.handlers.JavacHandlerUtil.injectMethod;
 import static lombok.javac.handlers.JavacHandlerUtil.recursiveSetGeneratedBy;
 import static lombok.javac.handlers.JavacHandlerUtil.typeMatches;
@@ -13,6 +16,7 @@ import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.tree.JCTree.JCAnnotation;
 import com.sun.tools.javac.tree.JCTree.JCBlock;
 import com.sun.tools.javac.tree.JCTree.JCExpression;
+import com.sun.tools.javac.tree.JCTree.JCAssign;
 import com.sun.tools.javac.tree.JCTree.JCExpressionStatement;
 import com.sun.tools.javac.tree.JCTree.JCFieldAccess;
 import com.sun.tools.javac.tree.JCTree.JCIdent;
@@ -22,6 +26,7 @@ import com.sun.tools.javac.tree.JCTree.JCModifiers;
 import com.sun.tools.javac.tree.JCTree.JCStatement;
 import com.sun.tools.javac.tree.JCTree.JCClassDecl;
 import com.sun.tools.javac.tree.JCTree.JCTypeParameter;
+import com.sun.tools.javac.util.Name;
 import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
 import com.sun.tools.javac.util.List;
 import com.sun.tools.javac.util.ListBuffer;
@@ -106,7 +111,11 @@ public class HandleHookFunction extends JavacASTAdapter {
 	private void injectHooksIntoConstructors(JavacNode typeNode, JCClassDecl type, java.util.List<HookMethod> hookMethods) {
 		java.util.List<ConstructorMethod> constructors = findConstructors(typeNode);
 		if (constructors.isEmpty()) {
-			injectDefaultConstructor(typeNode, type, hookMethods);
+			if (isRecord(typeNode)) {
+				injectRecordCanonicalConstructor(typeNode, type, hookMethods);
+			} else {
+				injectDefaultConstructor(typeNode, type, hookMethods);
+			}
 			return;
 		}
 		for (ConstructorMethod constructor : constructors) {
@@ -117,7 +126,11 @@ public class HandleHookFunction extends JavacASTAdapter {
 				constructor.node.addError("@HookFunction does not support constructors that continue processing after this(...).");
 				continue;
 			}
-			appendHookCalls(constructor.node, constructor.method, hookMethods);
+			if (isRecord(typeNode)) {
+				normalizeRecordConstructor(constructor.node, constructor.method, hookMethods);
+			} else {
+				appendHookCalls(constructor.node, constructor.method, hookMethods);
+			}
 		}
 	}
 
@@ -126,9 +139,17 @@ public class HandleHookFunction extends JavacASTAdapter {
 		for (JavacNode child : typeNode.down()) {
 			if (child.getKind() != Kind.METHOD) continue;
 			JCMethodDecl method = (JCMethodDecl) child.get();
-			if (method.name.contentEquals("<init>") && (method.mods.flags & Flags.GENERATEDCONSTR) == 0) constructors.add(new ConstructorMethod(child, method));
+			if (method.name.contentEquals("<init>") && ((method.mods.flags & Flags.GENERATEDCONSTR) == 0 || isRecordConstructor(typeNode, method))) constructors.add(new ConstructorMethod(child, method));
 		}
 		return constructors;
+	}
+
+	private boolean isRecordConstructor(JavacNode typeNode, JCMethodDecl method) {
+		return isRecord(typeNode) && (method.mods.flags & Flags.GENERATEDCONSTR) != 0;
+	}
+
+	private boolean isRecord(JavacNode typeNode) {
+		return (((JCClassDecl) typeNode.get()).mods.flags & RECORD) != 0;
 	}
 
 	private ConstructorDelegation getConstructorDelegation(JCMethodDecl constructor) {
@@ -147,6 +168,72 @@ public class HandleHookFunction extends JavacASTAdapter {
 		if (invocation instanceof JCFieldAccess) return ((JCFieldAccess) invocation).name.toString();
 		if (invocation instanceof JCIdent) return ((JCIdent) invocation).name.toString();
 		return "";
+	}
+
+
+	private void injectRecordCanonicalConstructor(JavacNode typeNode, JCClassDecl type, java.util.List<HookMethod> hookMethods) {
+		JavacTreeMaker maker = typeNode.getTreeMaker();
+		long access = type.mods.flags & (Flags.PUBLIC | Flags.PROTECTED | Flags.PRIVATE);
+		JCModifiers mods = maker.Modifiers(access);
+		List<JCVariableDecl> params = recordComponentParams(typeNode, typeNode);
+		List<JCStatement> statements = recordComponentAssignments(typeNode, typeNode).appendList(hookCallStatements(typeNode, hookMethods));
+		JCBlock body = maker.Block(0L, statements);
+		JCMethodDecl constructor = maker.MethodDef(mods, typeNode.toName("<init>"), null, List.<JCTypeParameter>nil(), params, List.<JCExpression>nil(), body, null);
+		recursiveSetGeneratedBy(constructor, hookMethods.get(0).node);
+		injectMethod(typeNode, hookMethods.get(0).node, constructor);
+	}
+
+	private void normalizeRecordConstructor(JavacNode constructorNode, JCMethodDecl constructor, java.util.List<HookMethod> hookMethods) {
+		JavacNode typeNode = constructorNode.up();
+		if ((constructor.mods.flags & (COMPACT_RECORD_CONSTRUCTOR | Flags.GENERATEDCONSTR)) == 0) {
+			appendHookCalls(constructorNode, constructor, hookMethods);
+			return;
+		}
+
+		boolean wasGeneratedConstructor = (constructor.mods.flags & Flags.GENERATEDCONSTR) != 0;
+		constructor.mods.flags &= ~COMPACT_RECORD_CONSTRUCTOR;
+		constructor.mods.flags &= ~Flags.GENERATEDCONSTR;
+		if (constructor.params == null || constructor.params.isEmpty()) constructor.params = recordComponentParams(typeNode, constructorNode);
+		List<JCStatement> originalStatements = wasGeneratedConstructor || constructor.body == null ? List.<JCStatement>nil() : constructor.body.stats;
+		List<JCStatement> statements = originalStatements
+			.appendList(recordComponentAssignments(typeNode, constructorNode))
+			.appendList(hookCallStatements(constructorNode, hookMethods));
+		constructor.body = constructorNode.getTreeMaker().Block(0L, statements);
+		constructorNode.getAst().setChanged();
+	}
+
+	private List<JCVariableDecl> recordComponentParams(JavacNode typeNode, JavacNode source) {
+		JavacTreeMaker maker = source.getTreeMaker();
+		ListBuffer<JCVariableDecl> params = new ListBuffer<JCVariableDecl>();
+		for (JavacNode componentNode : recordComponentNodes(typeNode)) {
+			JCVariableDecl component = (JCVariableDecl) componentNode.get();
+			JCExpression paramType = cloneType(maker, component.vartype, source);
+			JCVariableDecl param = maker.VarDef(maker.Modifiers(Flags.PARAMETER, component.mods.annotations), component.name, paramType, null);
+			params.append(recursiveSetGeneratedBy(param, source));
+		}
+		return params.toList();
+	}
+
+	private List<JCStatement> recordComponentAssignments(JavacNode typeNode, JavacNode source) {
+		JavacTreeMaker maker = source.getTreeMaker();
+		ListBuffer<JCStatement> assignments = new ListBuffer<JCStatement>();
+		for (JavacNode componentNode : recordComponentNodes(typeNode)) {
+			Name componentName = ((JCVariableDecl) componentNode.get()).name;
+			JCFieldAccess thisField = maker.Select(maker.Ident(source.toName("this")), componentName);
+			JCAssign assign = maker.Assign(thisField, maker.Ident(componentName));
+			assignments.append(recursiveSetGeneratedBy(maker.Exec(assign), source));
+		}
+		return assignments.toList();
+	}
+
+	private java.util.List<JavacNode> recordComponentNodes(JavacNode typeNode) {
+		java.util.List<JavacNode> components = new ArrayList<JavacNode>();
+		for (JavacNode child : typeNode.down()) {
+			if (child.getKind() != Kind.FIELD) continue;
+			JCVariableDecl field = (JCVariableDecl) child.get();
+			if ((field.mods.flags & RECORD) != 0) components.add(child);
+		}
+		return components;
 	}
 
 	private void injectDefaultConstructor(JavacNode typeNode, JCClassDecl type, java.util.List<HookMethod> hookMethods) {
